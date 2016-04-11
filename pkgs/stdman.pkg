@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e -u -o pipefail
+ROOT="${OVERLAY_TGT}"
+rm -rf /tmp/stdman
+git clone https://github.com/jeaye/stdman.git /tmp/stdman
+cd /tmp/stdman
+./configure --prefix="${OVERLAY_TGT}"
+make install

@@ -1,0 +1,327 @@
+#!/bin/bash
+set -e -u -o pipefail
+
+SKIP_IF_EXITS=0
+
+CFG_FILE="${HOME}/.upkg/config"
+SOURCES="${HOME}/.upkg/sources"
+
+function show_help() {
+cat <<EOF
+Usage: pkger list|help|init
+       pkger install|remove|version PKG
+
+Commands:
+  init
+  install
+  list
+  remove
+  help
+EOF
+}
+
+function cleanup() {
+    find "${ROOT}" -type l -xtype l -exec rm -v '{}' ';'
+    find "${ROOT}" -depth -type d -empty -exec rmdir -v '{}' ';'
+}
+
+function pkg_find () {
+    local IFS=':'
+    local NEWPATH
+    local DIR
+    local PATHVARIABLE=${2:-PATH}
+    for DIR in ${!PATHVARIABLE} ; do
+        if [[ "$DIR" != "$1" ]] ; then
+            NEWPATH=${NEWPATH:+$NEWPATH:}$DIR
+        fi
+    done
+    export $PATHVARIABLE="$NEWPATH"
+}
+
+function init_cli() {
+    if [[ -e "$CFG_FILE" ]]; then
+        echo "$CFG_FILE already exists."
+        source "${CFG_FILE}"
+    fi
+    if grep aufs /proc/filesystems &>/dev/null; then
+        NO_AUFS=0
+    else
+        NO_AUFS=1
+    fi
+    if [[ -x /usr/bin/apt-get ]]; then
+        PKG_MANAGER="apt-get"
+    elif [[ -x /usr/bin/yum ]]; then
+        PKG_MANAGER="yum"
+    else
+        PKG_MANAGER="unknown"
+    fi
+    THIS_FILE="$(readlink -f ${BASH_SOURCE[0]})"
+    THIS_DIR="$(dirname "${THIS_FILE}")"
+    SCRATCH="$(mktemp "${TMPDIR:-/tmp}/upkg.XXXXXXXXXX")"
+    trap "rm -f ${SCRATCH}" EXIT
+    cat > "${SCRATCH}" <<EOF
+ROOT="${ROOT:-${HOME}/root}"
+PKG_ROOT="${PKG_ROOT:-${HOME}/pkgs}"
+NO_OVERLAYFS=${NO_OVERLAYFS:-${NO_AUFS}}
+NATIVE_PKG_TYPE=${NATIVE_PKG_TYPE:-${PKG_MANAGER}}
+EOF
+    while true; do
+        cat $SCRATCH
+        echo "Continue with this file [Y/E/N]?"
+        read -n 1 answer
+        echo
+        case $answer in
+            Y|y) break;;
+            E|e) vim $SCRATCH;;
+            N|n) exit 1;;
+            *) echo "Unknown answer ${answer}"
+        esac
+    done
+    source "$SCRATCH"
+    mkdir -p "${ROOT}"/{bin,man,share/man} "${PKG_ROOT}"
+    mkdir -p "${SOURCES}"
+    mv "$SCRATCH" "${CFG_FILE}"
+    ln -svf "$THIS_FILE" "${ROOT}/bin/upkg"
+    ln -svf "$THIS_DIR/pkgs" "${SOURCES}/upkg"
+}
+
+function help_cli() {
+    show_help;
+}
+
+function list_cli() {
+    shopt -s nullglob
+    echo "Available pkgs:"
+    local i
+    for i in $SOURCES/*/*.pkg; do
+        echo "* $(basename "$i" .pkg)"
+    done
+    echo
+    echo "Installed pkgs: "
+    local dir
+    for dir in $PKG_ROOT/*; do
+        if [[ -d "$dir" ]]; then
+            local name=${dir##*/}
+            if [[ -e "$dir/version" ]]; then
+                local version="$(cat "$dir/version")"
+            else
+                local version="unknow"
+            fi
+            printf "* %-15s %s\n" "$name" "$version"
+        fi
+    done
+}
+
+function remove_cli() {
+    rm -rvf "${PKG_ROOT}/$1"
+    cleanup
+}
+
+function require_deb() {
+    if [[ ${NATIVE_PKG_TYPE} != "apt-get" ]]; then
+        return;
+    fi
+    local pkg
+    local missing=()
+    for pkg in "$@"; do
+        if ! dpkg -s "${pkg}" &> /dev/null; then
+            missing+=("${pkg}")
+        fi
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return;
+    fi
+    echo "About to install ${missing[@]}"
+    sudo apt-get install "${missing[@]}"
+}
+
+function require_rpm() {
+    if [[ ${NATIVE_PKG_TYPE} != "yum" ]]; then
+        return;
+    fi
+    local pkg
+    local missing=()
+    for pkg in "$@"; do
+        if ! rpm -q "${pkg}" &> /dev/null; then
+            missing+=("${pkg}")
+        fi
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return;
+    fi
+    echo "About to install ${missing[@]}"
+    sudo yum install "${missing[@]}"
+}
+
+function pkg_lookup() {
+    if [[ "$1" =~ .*/.* ]]; then
+        if [[ ! -e "$1" ]]; then
+            echo "No such file: $1" >&2
+            exit 1
+        fi
+        readlink -f "$1"
+        return
+    else
+        for d in "$SOURCES"/*; do
+            if [[ -f "$d/$1.pkg" ]]; then
+                readlink -f "$d/$1.pkg"
+                return
+            fi
+        done
+        echo "No such package: $1" >&2
+        exit 1
+    fi
+}
+
+function install_cli() {
+    PKG_FILE="$(pkg_lookup "$1")"
+    PKG="$(basename "$1" .pkg)"
+    PKG_DIR=${PKG_ROOT}/${PKG}
+    if [[ $SKIP_IF_EXITS -eq 1 && -d ${PKG_DIR} ]]; then
+        echo "skipping existing: $PKG"
+        return
+    fi
+    SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/${PKG}.XXXXXXXXXX")"
+    MOUNTED=0
+    function finish() {
+        rm -rf "$SCRATCH"
+        if [[ -n "${PREFIX_TMP:-}" ]]; then
+            sudo rm -rf "${PREFIX_TMP}"
+        fi;
+        if [[ "$MOUNTED" -eq 1 ]]; then
+            sudo umount "${ROOT}"
+        fi
+    }
+    trap finish EXIT
+    function remove_old() {
+        if [[ -d "${PKG_DIR}" ]]; then
+            echo "Removing old ${PKG_DIR}"
+            rm -rf "${PKG_DIR}"
+            find "${ROOT}" -type l ! -exec test -r {} \; -delete
+        fi
+    }
+    if [[ $NO_OVERLAYFS -eq 1 ]]; then
+        if [[ -d "${PKG_DIR}" ]]; then
+            echo "${PKG_DIR} already exists, remove it and run me again" >&2
+            exit 1
+        fi
+        export PREFIX="${PKG_DIR}"
+        PREFIX_TMP="${PREFIX}"
+        mkdir -p "${PKG_DIR}"
+    else
+        PREFIX_TMP="$(mktemp -d "${TMPDIR:-/tmp}/${PKG}_overlay.XXXXXXXXXX")"
+        sudo mount -t aufs -o br=${PREFIX_TMP}=rw:${ROOT}=ro -o udba=reval none ${ROOT}
+        #sudo mount -t overlayfs none -olowerdir="${ROOT}",upperdir="${OVERLAY_TMP}" "${ROOT}"
+        MOUNTED=1
+        export PREFIX=${ROOT}
+    fi
+    export CFLAGS="${CFLAGS:-} -I'${ROOT}/include'"
+    export LDFLAGS="${LDFLAGS:-} -L'${ROOT}/lib'"
+    export NATIVE_PKG_TYPE
+    export -f require_deb require_rpm
+    require_deb build-essential
+    require_rpm automake autoconf gcc
+    cd "$SCRATCH"
+    set +e
+    bash -e -u -o pipefail "${PKG_FILE}" "$@"
+    RES="$?"
+    set -e
+    if [[ "$RES" -gt 0 ]]; then
+        echo "Installation failed;" >&2
+        exit 1
+    fi
+
+    if [[ $NO_OVERLAYFS -ne 1 ]]; then
+        sudo umount "${ROOT}"
+        MOUNTED=0
+        sudo rm -rf "${PREFIX_TMP}"/.wh..wh.*
+        remove_old
+        mv "${PREFIX_TMP}" "${PKG_DIR}"
+    fi
+    unset -v PREFIX_TMP
+
+    date +%F > "${PKG_DIR}/version"
+    echo "==================================================="
+    echo "${PKG} successfully installed. Regenerating links."
+    echo "==================================================="
+    cd "${PKG_DIR}"
+
+    for file in $(find . -type f -o -type l); do
+        dir="$(dirname "$file")"
+        mkdir -p "${ROOT}/${dir}"
+        if [[ -L  "$file" ]]; then
+            cp -dv "$file" "${ROOT}/$file"
+        else
+            ln -vsf "$(readlink -f "$file")" "${ROOT}/$file"
+        fi
+    done
+}
+
+if [[ $# -eq 0 ]]; then
+    show_help;
+    exit 0;
+fi
+
+REQUIRES_PKG=0
+case $1 in
+remove | install)
+    REQUIRES_PKG=1;;
+list | help | init) ;;
+*)
+    echo "Unknown command $1" >&2;
+    show_help >&2;
+    exit 1;;
+esac
+FN_NAME="$1"
+FN="$1_cli"
+
+shift 1;
+
+OPTIND=1
+
+while getopts "hb?n" opt; do
+    case "$opt" in
+    h|\?)
+        show_help
+        exit 0
+        ;;
+    n)
+        SKIP_IF_EXITS=1
+        ;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+if [[ "${1:-}" = "--" ]]; then
+    shift
+fi
+
+if [[ $REQUIRES_PKG -eq 1 ]]; then
+    if [[ $# -eq 0 ]]; then
+        echo "$FN_NAME requires one or more packages" >&2;
+        exit 1
+    fi
+else
+    if [[ $# -ne 0 ]]; then
+        echo "$FN_NAME doesn't take any argument" >&2;
+        exit 1
+    fi
+fi
+
+case "$FN_NAME" in
+remove | install | list)
+    if [[ ! -e "${CFG_FILE}" ]]; then
+        echo "upkg isn't initialized. Run upkg init." >&2
+        exit 1
+    fi
+    source "${CFG_FILE}"
+esac
+
+if [[ $REQUIRES_PKG -eq 1 ]]; then
+    for PKG in "$@"; do
+        "$FN" "$PKG"
+    done
+else
+    "$FN"
+fi

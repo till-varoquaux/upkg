@@ -1,0 +1,9 @@
+# -*- mode:sh -*-
+require_deb libunwind-dev
+require_rpm libunwind-devel
+git clone --depth 1 -b v4.11 https://github.com/strace/strace.git
+cd strace
+./bootstrap
+./configure --prefix="${PREFIX}" --with-libunwind
+make
+make install

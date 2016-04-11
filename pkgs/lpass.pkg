@@ -1,0 +1,5 @@
+require_deb openssl libcurl4-openssl-dev libxml2 libssl-dev libxml2-dev pinentry-curses xclip
+git clone https://github.com/lastpass/lastpass-cli.git
+cd lastpass-cli
+make PREFIX="${PREFIX}"
+make COMPDIR="${PREFIX}/share/bash-completion/completions" PREFIX="${PREFIX}" install

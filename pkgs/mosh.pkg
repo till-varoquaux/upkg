@@ -1,0 +1,8 @@
+require_deb protobuf-compiler libssl-dev
+git clone https://github.com/keithw/mosh
+cd mosh
+git reset --hard c6cd99ba971123aa4072d3ab8466c3d2467db9bd
+./autogen.sh
+./configure --prefix="${PREFIX}"
+make
+make install
